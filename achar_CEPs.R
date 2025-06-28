@@ -1,16 +1,19 @@
 source("general-functions.R") # General functions
 
 # packages
-required_packages <- c("data.table", "geocodebr", "geosphere")
+required_packages <- c("data.table", "geocodebr", "geosphere", "sf", "leaflet")
 
 check_and_install_packages(required_packages)
 lapply(required_packages, library, character.only = TRUE)
 
-file <- paste0("data/estabs_sem_coords.csv")
-dt <- fread(file, encoding = "Latin-1")
+file <- paste0("data/active_rp_ju.csv")
+dt <- fread(file, encoding = "Latin-1", fill = TRUE)
 names(dt)
 
-ceps_unicos <- unique(na.omit(dt$CO_CEP))
+dt_select <- dt[precisao=="cep"]
+dt_select <- dt[precisao %in% c("cep", "localidade", "municipio")]
+
+ceps_unicos <- unique(na.omit(dt_select$cep))
 
 # amostra de CEPs
 
@@ -79,3 +82,71 @@ final[, cep := as.numeric(gsub("-", "", cep))]
 estabs_com_coords <- merge(dt, final, by = "cep", all = FALSE)
 fwrite(estabs_com_coords, file = paste0("data/estabs_com_coords.csv"), sep = ";", quote = FALSE, row.names=FALSE)
 
+
+####################################
+## Selection
+
+
+dt_select <- dt[precisao=="cep"]
+dt_select <- dt[precisao %in% c("cep", "localidade", "municipio")]
+
+select_ <- dt_select[cep %in% c(14098000)]
+
+
+######################################
+### convexhull
+
+
+df_ceps[, uniqueN(cep)]
+
+select <- df_ceps[cep %in% c("14098-000")]
+select <- df_ceps
+
+dt_sf <- st_as_sf(select, coords = c("lon", "lat"), crs = 4326)  # WGS84
+
+dt_sf <- st_transform(dt_sf, crs = 3857)  # Web Mercator
+
+cep_groups <- split(dt_sf, dt_sf$cep)
+
+# Step 4: Compute convex hull for each cep
+convex_list <- lapply(cep_groups, function(group) {
+  combined <- st_combine(group)                 # sfc MULTIPOINT
+  hull <- st_convex_hull(combined)[[1]]         # extract sfg POLYGON
+  return(hull)
+})
+
+convex_areas <- st_sf(
+  cep = names(convex_list),
+  geometry = st_sfc(convex_list),
+  crs = 3857
+)
+
+convex_areas$area_m2 <- st_area(convex_areas)
+
+new_geoms <- lapply(convex_areas$geometry, function(geom) {
+  if (st_geometry_type(geom) %in% c("POINT", "LINESTRING")) {
+    st_buffer(geom, dist = 1)
+  } else {
+    geom
+  }
+})
+
+# Step 2: Create an sfc geometry collection with the right CRS
+new_sfc <- st_sfc(new_geoms, crs = st_crs(convex_areas))
+
+# Step 3: Replace geometry with new sfc in the sf object using st_set_geometry()
+convex_areas_fixed <- st_set_geometry(convex_areas, new_sfc)
+
+convex_areas_fixed_wgs <- st_transform(convex_areas_fixed, 4326)
+dt_sf_wgs <- st_transform(dt_sf, 4326)
+
+leaflet() %>%
+  addProviderTiles(providers$CartoDB.Positron) %>%
+  addPolygons(data = convex_areas_fixed_wgs,
+              fillColor = "blue", fillOpacity = 0.3,
+              color = "black", weight = 1,
+              label = ~paste0("CEP: ", cep, "<br>Area: ", round(area_m2, 0), " m²")) %>%
+  addCircleMarkers(data = dt_sf_wgs,
+                   radius = 4, color = "red",
+                   stroke = FALSE, fillOpacity = 0.8,
+                   label = ~paste("CEP:", cep))
